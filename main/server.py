@@ -58,6 +58,68 @@ stt_model = WhisperModel("small", device="cpu", compute_type="int8")
 #     "zero-shot-classification", model="facebook/bart-large-mnli"
 # )
 
+
+# ===============================
+# Log rotate 
+# ===============================
+
+# -------------------------------
+# 디렉토리 용량 관리 (오디오 100MB)
+# -------------------------------
+def cleanup_directory(directory: str, max_bytes: int):
+    if not os.path.exists(directory):
+        return
+
+    files = [
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if os.path.isfile(os.path.join(directory, f))
+    ]
+    total_size = sum(os.path.getsize(f) for f in files)
+
+    if total_size <= max_bytes:
+        return
+
+    # 오래된 파일 순으로 삭제
+    files_sorted = sorted(files, key=lambda x: os.path.getmtime(x))
+    for f in files_sorted:
+        if total_size <= max_bytes:
+            break
+        try:
+            size = os.path.getsize(f)
+            os.remove(f)
+            total_size -= size
+            print(f"[CLEANUP] Deleted: {f}")
+        except Exception as e:
+            print(f"[CLEANUP ERROR] {f}: {e}")
+
+
+# -------------------------------
+# qa_list.log 파일 전용 rotate (30MB)
+# -------------------------------
+def rotate_qa_log(logger, handler, max_bytes):
+    log_path = handler.baseFilename
+
+    if os.path.exists(log_path) and os.path.getsize(log_path) >= max_bytes:
+        logger.removeHandler(handler)
+        handler.close()
+
+        # 기존 파일 → 백업
+        backup_path = log_path + ".1"
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        os.rename(log_path, backup_path)
+
+        # 새 핸들러 만들기
+        new_handler = logging.FileHandler(log_path, encoding="utf-8")
+        formatter = logging.Formatter("%(asctime)s - %(message)s", "%Y-%m-%d %H:%M:%S")
+        new_handler.setFormatter(formatter)
+        logger.addHandler(new_handler)
+
+        return new_handler
+
+    return handler
+
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 from pathlib import Path
 
@@ -513,6 +575,40 @@ def transcribe_file(path: str) -> Tuple[str, str]:
     # 4) 그 외 애매한 건 전부 ko로 본다 (영어 질문 소수라고 가정)
     return text_ko, "ko"
 
+def is_repeated_stt(text: str) -> bool:
+    if not text:
+        return False
+
+    t = text.strip().lower()
+
+    # -----------------------
+    # 1) 동일 문자 반복 (아아아아, ㅎㅎㅎㅎ, aaaaa)
+    # -----------------------
+    # 같은 문자 4번 이상 연속
+    if re.search(r"(.)\1{3,}", t):
+        return True
+
+    # -----------------------
+    # 2) 동일 단어 반복 (hello hello hello)
+    # -----------------------
+    words = re.findall(r"[가-힣a-zA-Z]+", t)
+    if len(words) >= 3:
+        unique = set(words)
+        # 단어 종류는 적고 반복 횟수만 많은 경우
+        if len(unique) <= 2 and len(words) / max(len(unique), 1) >= 3:
+            return True
+
+    # -----------------------
+    # 3) 붙어 있는 반복 (hellohellohello)
+    # -----------------------
+    collapsed = re.sub(r"\s+", "", t)
+    for w in set(words):
+        if len(w) >= 2 and collapsed.count(w) >= 3:
+            return True
+
+
+    return False
+
 # =====================================
 # Warmup
 # =====================================
@@ -550,6 +646,7 @@ async def start_chat(
     - question_text: 텍스트 바로 질의 (STT 생략)
     """
     global LAST_ANSWER
+    global qa_file_handler
     start_time = time.time()
     text = ""
     lang = "ko" 
@@ -590,6 +687,40 @@ async def start_chat(
     dur_stt = ts_stt_end - ts_stt_start
     print(f"[PERF] STT: {dur_stt:.3f} sec")
     print(f"[STT 결과] ({lang}) {text}")
+
+    if is_repeated_stt(text):
+        msg = REASK_TEMPLATES[int(time.time()) % len(REASK_TEMPLATES)]
+        emotion_id = check_emotion(msg)
+        action_id = check_action(msg)
+        meta_for_tts = {"user": "문순득", "lang": "ko"}
+
+        tts_response = await gateway.send_to_tts(
+            msg, meta_for_tts, emotion_id, action_id, "ko"
+        )
+
+        audio_uri = ""
+        if getattr(tts_response, "is_success", False):
+            tts_data = tts_response.json()
+            audio_uri = (
+                tts_data.get("audio_file")
+                or tts_data.get("file")
+                or tts_data.get("url")
+                or ""
+            )
+
+        return JSONResponse(
+            {
+                "user": "문순득",
+                "input": text,
+                "response": msg,
+                "region_index": "-1",
+                "scriptList": [
+                    {"action": [emotion_id, action_id], "text": msg}
+                ],
+                "audioURIList": [audio_uri] if audio_uri else [],
+                "combinedAudioPath": None,
+            }
+        )
 
     if is_repeat_request(text):
         if LAST_ANSWER.get("text"):
@@ -775,6 +906,18 @@ async def start_chat(
 
     qa_logger.info(f"Q({lang}): {text}\nA({language_style}): {speak_text}")
 
+    # -------------------------
+    # 오디오 디렉토리 정리 (100MB)
+    # -------------------------
+    cleanup_directory(AUDIO_OUTPUT_DIR, 100 * 1024 * 1024)
+
+    # -------------------------
+    # qa_list.log 파일 rotate (30MB)
+    # -------------------------
+    new_handler = rotate_qa_log(qa_logger, qa_file_handler, 30 * 1024 * 1024)
+    if new_handler is not None:
+        qa_file_handler = new_handler
+
     print(f"total elapsed time : {time.time() - start_time:.3f}s")
 
     return JSONResponse(
@@ -782,7 +925,7 @@ async def start_chat(
             "user": llm_data.get("user", "unknown"),
             "input": text,
             "response": speak_text,
-            "region_index": llm_data.get("region_index", -1),
+            "region_index": llm_data.get("region_index", "-1"),
             "scriptList": [
                 {"action": [emotion_id, action_id], "text": speak_text}
             ],

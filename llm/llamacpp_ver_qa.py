@@ -667,7 +667,7 @@ def generate_answer_with_llama(context: str, question: str) -> str:
     # 문장 수 2개까지만 잘라내기 (한/영 공통)
     sentences = [s.strip() for s in re.split(r"[\.!?]", text) if s.strip()]
     if len(sentences) > 2:
-        text = ". ".join(sentences[:2])
+        text = ". ".join(sentences[:2])+"."
 
     # 한국어일 때만 반말→존댓말 후처리
     if not use_english:

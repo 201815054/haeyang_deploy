@@ -368,17 +368,6 @@ retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
 # print("[FAISS] ko/en vectorstores loaded.")
 
 
-
-
-
-
-
-
-
-
-
-
-
 XLSX_PATH = "./data/haeyang_qna_v2_4.xlsx"
 
 df_raw = pd.read_excel(XLSX_PATH)
